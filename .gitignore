@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 虛擬環境
+.venv/
+env/
+venv/
+
+# Playwright
+playwright-report/
+
+# 暫存與 checkpoint
+temp/*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
