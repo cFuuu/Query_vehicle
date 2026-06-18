@@ -2,11 +2,11 @@
 # =============================================================================
 #  設定區（修改這裡即可）
 # =============================================================================
-INPUT_FILE  = "20260614_G-S-P_AVC1 list.csv"  # 只填檔名，檔案需放在 input/ 資料夾
+INPUT_FILE  = "G_0603-0617.csv"  # 只填檔名，檔案需放在 input/ 資料夾
 # OUTPUT_FILE 會自動命名為「原檔名_result.csv」，不需手動設定
-PLATE_COL   = "Plate_1st_Recong"      # Excel/CSV 中車牌所在欄位名稱（txt 模式忽略）
+PLATE_COL   = "Final_License_Plate_Number"      # Excel/CSV 中車牌所在欄位名稱（txt 模式忽略）
 DELAY_SEC   = 2.0                      # 每筆查詢間隔秒數（每個 thread 各自等待）
-THREADS     = 3                        # 平行查詢數量（建議 3~5，過高有被封風險）
+THREADS     = 5                        # 平行查詢數量（建議 3~5，過高有被封風險）
 # =============================================================================
 
 import csv, time, re, math, threading, json
@@ -200,6 +200,11 @@ class VehicleQueryRunner:
         output_cols = original_cols[:plate_idx+1] + ["vehicle_model", "is_target"] + original_cols[plate_idx+1:]
 
         total = len(records)
+        plate_keys = [str(r.get(self.plate_col, "")).strip().upper().replace(" ", "") for r in records]
+        plate_to_record_indexes = {}
+        for idx, plate in enumerate(plate_keys):
+            if not self._is_invalid_plate(plate):
+                plate_to_record_indexes.setdefault(plate, []).append(idx)
 
         # ── 方案 C：先對有效車牌去重，只查不重複的 ──
         unique_plates = []
@@ -221,7 +226,9 @@ class VehicleQueryRunner:
         # 查詢唯一車牌，結果存入 cache（多 thread 平行）
         cache: dict[str, tuple[str, str]] = {}  # plate -> (vehicle_model, is_target)
         lock    = threading.Lock()
+        write_lock = threading.Lock()
         counter = [0]  # 用 list 讓 thread 可以共享計數
+        written_indexes = set()
 
         # 若有進度記錄，載入並過濾已查詢的車牌
         if Path(self.checkpoint_file).exists():
@@ -235,6 +242,23 @@ class VehicleQueryRunner:
             except Exception as e:
                 print(f"進度記錄讀取失敗（{e}），從頭開始查詢。\n")
 
+        # 初始化結果檔（先寫表頭），並先寫出「目前可確定」的資料
+        self._init_output_file(output_cols)
+        initial_rows = []
+        for idx, record in enumerate(records):
+            plate = plate_keys[idx]
+            if self._is_invalid_plate(plate):
+                row = {**record, "vehicle_model": "", "is_target": "車牌無效"}
+            elif plate in cache:
+                model, result = cache[plate]
+                row = {**record, "vehicle_model": model, "is_target": result}
+            else:
+                continue
+            initial_rows.append(row)
+            written_indexes.add(idx)
+        if initial_rows:
+            self._append_rows(initial_rows, output_cols)
+
         # 將車牌平均分配給各 thread
         n = self.threads
         if unique_plates:
@@ -243,7 +267,19 @@ class VehicleQueryRunner:
             print(f"啟動 {len(chunks)} 個平行查詢 thread...\n")
             with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
                 futures = [
-                    executor.submit(self._worker, chunk, cache, lock, counter, len(unique_plates))
+                    executor.submit(
+                        self._worker,
+                        chunk,
+                        records,
+                        output_cols,
+                        plate_to_record_indexes,
+                        written_indexes,
+                        cache,
+                        lock,
+                        write_lock,
+                        counter,
+                        len(unique_plates),
+                    )
                     for chunk in chunks
                 ]
                 for f in futures:
@@ -251,21 +287,20 @@ class VehicleQueryRunner:
         else:
             print("所有車牌均已從進度記錄恢復，跳過查詢階段。\n")
 
-        # 清除舊結果檔，確保不殘留上次執行的資料
-        if Path(self.output_file).exists():
-            Path(self.output_file).unlink()
-            print(f"已清除舊結果檔：{self.output_file}")
-
-        # 將 cache 結果回填至所有記錄並寫出
-        print(f"\n回填資料並寫出至：{self.output_file}")
-        for i, record in enumerate(records, 1):
-            plate = str(record.get(self.plate_col, "")).strip().upper().replace(" ", "")
+        # 補寫尚未落盤的列（理論上不多，保險補齊）
+        final_rows = []
+        for idx, record in enumerate(records):
+            if idx in written_indexes:
+                continue
+            plate = plate_keys[idx]
             if self._is_invalid_plate(plate):
                 model, result = "", "車牌無效"
             else:
                 model, result = cache.get(plate, ("", "查詢失敗"))
-            row = {**record, "vehicle_model": model, "is_target": result}
-            self._write_row(row, output_cols, i)
+            final_rows.append({**record, "vehicle_model": model, "is_target": result})
+            written_indexes.add(idx)
+        if final_rows:
+            self._append_rows(final_rows, output_cols)
 
         self._print_summary(start_time)
 
@@ -274,7 +309,9 @@ class VehicleQueryRunner:
             Path(self.checkpoint_file).unlink()
             print("進度記錄已清除。")
 
-    def _worker(self, plates_chunk: list, cache: dict, lock: threading.Lock,
+    def _worker(self, plates_chunk: list, records: list, output_cols: list,
+                plate_to_record_indexes: dict, written_indexes: set,
+                cache: dict, lock: threading.Lock, write_lock: threading.Lock,
                 counter: list, total_unique: int):
         """每個 thread 獨立啟動自己的瀏覽器，處理分配到的車牌清單"""
         stealth = Stealth()
@@ -297,20 +334,55 @@ class VehicleQueryRunner:
 
             for plate in plates_chunk:
                 model, result = self._query_plate(page, plate)
-                cache[plate] = (model, result)
+                # 先在鎖內更新共享狀態，再複製快照供 checkpoint 寫入
                 with lock:
+                    cache[plate] = (model, result)
                     counter[0] += 1
                     flag = "✅" if result == "是" else ""
                     print(f"[{counter[0]:3}/{total_unique}] {plate:<18} | {model:<35} | {result} {flag}")
-                    self._save_checkpoint(cache)
+
+                    rows_to_write = []
+                    for idx in plate_to_record_indexes.get(plate, []):
+                        if idx in written_indexes:
+                            continue
+                        record = records[idx]
+                        rows_to_write.append({**record, "vehicle_model": model, "is_target": result})
+                        written_indexes.add(idx)
+
+                    checkpoint_snapshot = dict(cache)
+
+                if rows_to_write:
+                    with write_lock:
+                        self._append_rows(rows_to_write, output_cols)
+
+                try:
+                    self._save_checkpoint(checkpoint_snapshot)
+                except Exception as e:
+                    # checkpoint 失敗不應中斷查詢；下次成功時仍會覆蓋成最新進度
+                    print(f"⚠️ checkpoint 寫入失敗：{str(e)[:80]}")
                 time.sleep(self.delay_sec)
 
             browser.close()
 
-    def _save_checkpoint(self, cache: dict):
+    def _save_checkpoint(self, cache_snapshot: dict):
         """將目前 cache 寫入進度記錄檔（每筆查詢後呼叫）"""
-        with open(self.checkpoint_file, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False)
+        import threading as _threading
+        tmp_file = self.checkpoint_file + f".{_threading.get_ident()}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(cache_snapshot, f, ensure_ascii=False)
+        Path(tmp_file).replace(self.checkpoint_file)
+
+    def _init_output_file(self, fieldnames: list):
+        """初始化結果檔並寫入表頭。"""
+        with open(self.output_file, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+            w.writeheader()
+
+    def _append_rows(self, rows: list, fieldnames: list):
+        """將多筆結果追加到結果檔。"""
+        with open(self.output_file, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+            w.writerows(rows)
 
     def _query_plate(self, page, plate: str) -> tuple:
         """查詢單一車牌，回傳 (vehicle_model, is_target)"""
@@ -325,14 +397,6 @@ class VehicleQueryRunner:
             return model, self.classifier.classify(model)
         except Exception as e:
             return str(e)[:50], "查詢失敗"
-
-    def _write_row(self, row: dict, fieldnames: list, index: int):
-        mode = "w" if index == 1 else "a"
-        with open(self.output_file, mode, newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
-            if index == 1:
-                w.writeheader()
-            w.writerow(row)
 
     def _print_summary(self, start_time: float):
         elapsed = int(time.time() - start_time)

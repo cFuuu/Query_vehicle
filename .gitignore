@@ -14,7 +14,15 @@ venv/
 playwright-report/
 
 # 暫存與 checkpoint
-temp/*.json
+temp/
+
+# 輸入 / 輸出資料檔（不追蹤大型資料）
+output/*.csv
+output/*.xlsx
+input/*.csv
+input/*.xlsx
+input/*.xls
+archive/
 
 # OS
 .DS_Store
