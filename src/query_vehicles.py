@@ -2,7 +2,7 @@
 # =============================================================================
 #  設定區（修改這裡即可）
 # =============================================================================
-INPUT_FILE  = "G_0603-0617.csv"  # 只填檔名，檔案需放在 input/ 資料夾
+INPUT_FILE  = "G_06-03~06-17_V2.csv"  # 只填檔名，檔案需放在 input/ 資料夾
 # OUTPUT_FILE 會自動命名為「原檔名_result.csv」，不需手動設定
 PLATE_COL   = "Final_License_Plate_Number"      # Excel/CSV 中車牌所在欄位名稱（txt 模式忽略）
 DELAY_SEC   = 2.0                      # 每筆查詢間隔秒數（每個 thread 各自等待）
@@ -215,12 +215,14 @@ class VehicleQueryRunner:
                 seen.add(p)
                 unique_plates.append(p)
 
-        skipped = total - sum(
+        valid_count = sum(
             1 for r in records
             if not self._is_invalid_plate(str(r.get(self.plate_col, "")).strip().upper().replace(" ", ""))
         )
+        skipped    = total - valid_count
+        duplicates = valid_count - len(unique_plates)
         print(f"讀取檔案：{self.input_path}")
-        print(f"總筆數：{total}  │  無效/跳過：{skipped}  │  不重複車牌：{len(unique_plates)}")
+        print(f"總筆數：{total}  │  無效/跳過：{skipped}  │  重複車牌：{duplicates}  │  不重複車牌：{len(unique_plates)}")
         print(f"預估查詢時間：約 {len(unique_plates) * self.delay_sec / 60:.0f} 分鐘\n")
 
         # 查詢唯一車牌，結果存入 cache（多 thread 平行）
